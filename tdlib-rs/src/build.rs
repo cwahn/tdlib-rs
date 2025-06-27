@@ -127,6 +127,135 @@ fn download_tdlib() {
     let _ = std::fs::remove_file(&zip_path);
 }
 
+// Add this new function to build universal binary on macOS
+#[cfg(target_os = "macos")]
+fn build_universal_tdlib_macos(dest_path: Option<String>) {
+    use std::process::Command;
+    
+    // Create temporary directories for each architecture
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let arm64_dir = format!("{}/tdlib_arm64", out_dir);
+    let x86_64_dir = format!("{}/tdlib_x86_64", out_dir);
+    
+    // Clean temporary directories
+    let _ = std::fs::remove_dir_all(&arm64_dir);
+    let _ = std::fs::remove_dir_all(&x86_64_dir);
+    
+    println!("Building TDLib for ARM64...");
+    
+    // Build for ARM64
+    std::env::set_var("CMAKE_OSX_ARCHITECTURES", "arm64");
+    std::env::set_var("CFLAGS", "-arch arm64");
+    std::env::set_var("CXXFLAGS", "-arch arm64");
+    std::env::set_var("LDFLAGS", "-arch arm64");
+    
+    download_tdlib();
+    let tdlib_source = format!("{}/tdlib", out_dir);
+    copy_dir_all(
+        std::path::Path::new(&tdlib_source),
+        std::path::Path::new(&arm64_dir),
+    ).unwrap();
+    
+    println!("Building TDLib for x86_64...");
+    
+    // Clean and rebuild for x86_64
+    let _ = std::fs::remove_dir_all(&tdlib_source);
+    
+    std::env::set_var("CMAKE_OSX_ARCHITECTURES", "x86_64");
+    std::env::set_var("CFLAGS", "-arch x86_64");
+    std::env::set_var("CXXFLAGS", "-arch x86_64");
+    std::env::set_var("LDFLAGS", "-arch x86_64");
+    
+    download_tdlib();
+    copy_dir_all(
+        std::path::Path::new(&tdlib_source),
+        std::path::Path::new(&x86_64_dir),
+    ).unwrap();
+    
+    // Create universal binary
+    println!("Creating universal binary...");
+    
+    let final_dir = if let Some(dest) = &dest_path {
+        dest.clone()
+    } else {
+        format!("{}/tdlib", out_dir)
+    };
+    
+    // Clean final directory
+    let _ = std::fs::remove_dir_all(&final_dir);
+    std::fs::create_dir_all(&final_dir).unwrap();
+    
+    // Copy structure from arm64 build (they should be identical except for the binary)
+    copy_dir_all(
+        std::path::Path::new(&arm64_dir),
+        std::path::Path::new(&final_dir),
+    ).unwrap();
+    
+    // Create universal binary for the main library
+    let arm64_lib = format!("{}/lib/libtdjson.dylib", arm64_dir);
+    let x86_64_lib = format!("{}/lib/libtdjson.dylib", x86_64_dir);
+    let universal_lib = format!("{}/lib/libtdjson.dylib", final_dir);
+    
+    // Check if both libraries exist
+    if std::path::Path::new(&arm64_lib).exists() && std::path::Path::new(&x86_64_lib).exists() {
+        let output = Command::new("lipo")
+            .args(&["-create", &arm64_lib, &x86_64_lib, "-output", &universal_lib])
+            .output()
+            .expect("Failed to run lipo command");
+        
+        if !output.status.success() {
+            eprintln!("lipo failed: {}", String::from_utf8_lossy(&output.stderr));
+            // Fallback to single architecture
+            std::fs::copy(&arm64_lib, &universal_lib).unwrap();
+            println!("Warning: Using ARM64 binary only due to lipo failure");
+        } else {
+            println!("Successfully created universal binary");
+        }
+    } else {
+        eprintln!("Warning: Could not find both architecture libraries, using available one");
+        if std::path::Path::new(&arm64_lib).exists() {
+            std::fs::copy(&arm64_lib, &universal_lib).unwrap();
+        } else if std::path::Path::new(&x86_64_lib).exists() {
+            std::fs::copy(&x86_64_lib, &universal_lib).unwrap();
+        }
+    }
+    
+    // Also handle versioned dylib if it exists
+    if let Ok(entries) = std::fs::read_dir(format!("{}/lib", arm64_dir)) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+            
+            // Handle versioned dylib files like libtdjson.1.8.0.dylib
+            if file_name_str.starts_with("libtdjson.") && file_name_str.ends_with(".dylib") && file_name_str != "libtdjson.dylib" {
+                let arm64_versioned = format!("{}/lib/{}", arm64_dir, file_name_str);
+                let x86_64_versioned = format!("{}/lib/{}", x86_64_dir, file_name_str);
+                let universal_versioned = format!("{}/lib/{}", final_dir, file_name_str);
+                
+                if std::path::Path::new(&x86_64_versioned).exists() {
+                    let output = Command::new("lipo")
+                        .args(&["-create", &arm64_versioned, &x86_64_versioned, "-output", &universal_versioned])
+                        .output();
+                    
+                    if let Ok(output) = output {
+                        if !output.status.success() {
+                            // Fallback to copying single arch
+                            let _ = std::fs::copy(&arm64_versioned, &universal_versioned);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Clean up temporary directories
+    let _ = std::fs::remove_dir_all(&arm64_dir);
+    let _ = std::fs::remove_dir_all(&x86_64_dir);
+    
+    // Now call generic_build with the universal binary
+    generic_build(dest_path);
+}
+
 #[cfg(any(feature = "download-tdlib", feature = "local-tdlib"))]
 /// Build the project using the `download-tdlib` or `local-tdlib` feature.
 /// # Arguments
@@ -381,21 +510,32 @@ pub fn build_pkg_config() {
 ///   // ...
 /// }
 /// ```
+// Replace the existing build_download_tdlib function with this version
 pub fn build_download_tdlib(dest_path: Option<String>) {
     #[cfg(not(feature = "docs"))]
     {
-        download_tdlib();
-        if dest_path.is_some() {
-            let out_dir = std::env::var("OUT_DIR").unwrap();
-            let tdlib_dir = format!("{}/tdlib", &out_dir);
-            let dest_path = dest_path.as_ref().unwrap();
-            copy_dir_all(
-                std::path::Path::new(&tdlib_dir),
-                std::path::Path::new(&dest_path),
-            )
-            .unwrap();
+        // On macOS, build universal binary by default
+        #[cfg(target_os = "macos")]
+        {
+            build_universal_tdlib_macos(dest_path);
         }
-        generic_build(dest_path);
+        
+        // On other platforms, use the original logic
+        #[cfg(not(target_os = "macos"))]
+        {
+            download_tdlib();
+            if dest_path.is_some() {
+                let out_dir = std::env::var("OUT_DIR").unwrap();
+                let tdlib_dir = format!("{}/tdlib", &out_dir);
+                let dest_path = dest_path.as_ref().unwrap();
+                copy_dir_all(
+                    std::path::Path::new(&tdlib_dir),
+                    std::path::Path::new(&dest_path),
+                )
+                .unwrap();
+            }
+            generic_build(dest_path);
+        }
     }
 }
 #[cfg(any(feature = "local-tdlib", feature = "docs"))]
